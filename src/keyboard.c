@@ -236,8 +236,16 @@ static void lookup_descriptor(struct keyboard *kbd, uint8_t code,
 					match = 0;
 			}
 
-			if (match && layer->keymap[code].op && (layer->nr_constituents > max)) {
-				*d = layer->keymap[code];
+			if (match && (layer->nr_constituents > max)) {
+				if (layer->keymap[code].op) {
+					*d = layer->keymap[code];
+				} else if (mods) {
+					d->op = OP_KEYSEQUENCE;
+					d->args[0].code = code;
+					d->args[1].mods = mods;
+				} else {
+					continue;
+				}
 				*dl = i;
 
 				max = layer->nr_constituents;
