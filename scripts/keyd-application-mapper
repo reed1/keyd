@@ -431,6 +431,34 @@ class XMonitor():
                     pass
 
 
+# Native i3 IPC adapter. i3 pushes a single event when focus (or the focused
+# window's title) actually changes, with the class/title already parsed, so we
+# avoid the X event flood and tree walking the generic XMonitor relies on.
+class I3():
+    def __init__(self, on_window_change):
+        import i3ipc
+
+        self.on_window_change = on_window_change
+        self.i3 = i3ipc.Connection()
+
+    def init(self):
+        pass
+
+    def _emit(self, con):
+        if con is not None:
+            self.on_window_change(con.window_class or '', con.name or '')
+
+    def run(self):
+        self.i3.on('window::focus', lambda i3, e: self._emit(e.container))
+        self.i3.on('window::title',
+            lambda i3, e: self._emit(e.container) if e.container and e.container.focused else None)
+
+        # Apply bindings for whatever is already focused at startup.
+        self._emit(self.i3.get_tree().find_focused())
+
+        self.i3.main()
+
+
 # :(
 class GnomeMonitor():
     def __init__(self, on_window_change):
@@ -496,6 +524,7 @@ def get_monitor(on_window_change):
         ('kde', KDE),
         ('wlroots', Wlroots),
         ('cosmic', Cosmic),
+        ('i3', I3),
         ('Gnome', GnomeMonitor),
         ('X', XMonitor),
     ]
