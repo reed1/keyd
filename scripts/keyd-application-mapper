@@ -440,18 +440,37 @@ class I3():
 
         self.on_window_change = on_window_change
         self.i3 = i3ipc.Connection()
+        self._last = None
 
     def init(self):
         pass
 
     def _emit(self, con):
-        if con is not None:
-            self.on_window_change(con.window_class or '', con.name or '')
+        # A focused workspace (or nothing) means no window has focus, e.g. after
+        # switching to an empty workspace. Reset to default (non-app) bindings.
+        if con is None or con.type == 'workspace':
+            key = ('', '')
+        else:
+            key = (con.window_class or '', con.name or '')
+
+        # A workspace switch fires workspace::focus and window::focus together;
+        # switching between two workspaces showing the same app resolves the same
+        # key. Skip the redundant re-apply so only genuine app changes hit keyd.
+        if key == self._last:
+            return
+        self._last = key
+        self.on_window_change(*key)
 
     def run(self):
         self.i3.on('window::focus', lambda i3, e: self._emit(e.container))
         self.i3.on('window::title',
             lambda i3, e: self._emit(e.container) if e.container and e.container.focused else None)
+
+        # Switching to an empty workspace emits no window::focus, so bindings
+        # would otherwise stay on the previous window's app. Re-resolve the
+        # focused container: an empty workspace reports itself as focused.
+        self.i3.on('workspace::focus',
+            lambda i3, e: self._emit(self.i3.get_tree().find_focused()))
 
         # Apply bindings for whatever is already focused at startup.
         self._emit(self.i3.get_tree().find_focused())

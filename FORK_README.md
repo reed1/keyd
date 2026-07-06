@@ -92,10 +92,18 @@ matched.
 Added a native `I3` adapter (`scripts/keyd-application-mapper`) that talks to
 i3's IPC socket via the `i3ipc` library instead of guessing from X state:
 
-- Subscribes to `window::focus` and re-applies bindings only when focus
-  actually changes, with the window class/title already parsed by i3.
+- Subscribes to `window::focus`, with the window class/title already parsed
+  by i3.
 - Subscribes to `window::title` (for the focused window) so title-based
   `app.conf` rules keep working.
+- Subscribes to `workspace::focus` so switching to an *empty* workspace resets
+  to the default (non-app) bindings. i3 emits no `window::focus` when a
+  workspace has no window to focus, so without this the previous window's
+  `app.conf` bindings would stay active on the empty workspace.
+- De-duplicates on the resolved `(class, title)`: a workspace switch fires
+  `workspace::focus` and `window::focus` together, so switching between two
+  workspaces showing the same app resolves the same key and is skipped — only
+  genuine app changes re-apply bindings via keyd.
 - Emits the currently focused window once at startup.
 
 It is registered ahead of the generic `X` monitor and is auto-detected:
