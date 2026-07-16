@@ -12,6 +12,9 @@ This is a fork of `keyd` consisting of the following changes:
    resolves the active window over i3's IPC socket instead of guessing from X
    state, fixing the case where an always-on-top window (e.g. Zoom) freezes
    `app.conf` bindings.
+3. **[Pause/resume control fifo](#3-pauseresume-control-fifo)** — lets a client
+   that grabs the keyboard (e.g. rofi) suspend `app.conf` bindings for as long
+   as it is up, fixing app overrides swallowing that client's own chords.
 
 ---
 
@@ -117,3 +120,69 @@ can never masquerade as active.
 Install the `i3ipc` python library (`python-i3ipc` on Arch), then run
 `keyd-application-mapper` as usual — it will print `i3 detected` and react to
 real focus changes.
+
+---
+
+## 3. Pause/resume control fifo
+
+### Problem
+
+Clients like rofi take an X keyboard grab **without** ever taking input focus,
+and map an override-redirect window. Nothing reports them as active:
+
+- i3 never manages an override-redirect window, so it emits no `window::focus`
+  and the window is absent from `get_tree()` — the `I3` adapter is blind to it.
+- `get_input_focus()` still returns the window *underneath*, because a grab is
+  not focus — so the generic `XMonitor` cannot see it either.
+
+The window underneath therefore keeps its `app.conf` bindings applied over the
+grab. Where a layer emulates a modifier (`[capslock_layer:C]`, so `capslock+m`
+is how `Ctrl+M` is typed), any `capslock_layer.<key>` override swallows that
+chord inside rofi:
+
+```
+[cursor]
+capslock_layer.m = C-S-f13     # rofi never sees Ctrl+M while cursor is underneath
+```
+
+Before the i3 adapter this was masked by accident: `XMonitor.get_floating_window()`
+scans for `_NET_WM_STATE_ABOVE`, which rofi sets, so rofi resolved to class
+`Rofi` and matched no section. That scan is exactly what change (2) removed to
+fix the always-on-top freeze, so the two bugs share one mechanism.
+
+### Fix
+
+`keyd-application-mapper` serves a control fifo at
+`/tmp/rlocal/keyd-application-mapper/fifo`, accepting one command per line:
+
+```
+pause <pid>     # suspend app.conf bindings; keyd is reset to config defaults
+resume <pid>    # drop the pause and re-apply the focused window's bindings
+```
+
+This is resolved centrally in `apply_bindings()`, not in any one monitor, so
+every adapter (i3, X, Wlroots, KDE, Gnome) gets it.
+
+- **Window events cannot clobber a pause.** A `window::title` event from the
+  window underneath (a terminal updating its title mid-grab) re-resolves to the
+  paused state instead of re-applying that window's bindings.
+- **A dead pauser cannot pin bindings.** `<pid>` liveness is rechecked on every
+  re-resolve, so a client killed before it can send `resume` is pruned rather
+  than disabling `app.conf` until the daemon restarts. Holding pausers as a set
+  also refcounts nesting (a rofi menu whose action opens a second rofi).
+- **Redundant transitions cost nothing.** Pausing a window that had no app
+  bindings resolves to the reset that is already live, so keyd is not called.
+
+### Usage
+
+Clients should open the fifo read-write, so that a write cannot block when the
+mapper is down and is discarded rather than replayed on its next start:
+
+```sh
+[ -p "$fifo" ] || return 0
+exec 3<>"$fifo"
+printf 'pause %s\n' "$$" >&3
+exec 3>&-
+```
+
+See `rlocal/bin/rofi` in reed's dotfiles for the full wrapper.

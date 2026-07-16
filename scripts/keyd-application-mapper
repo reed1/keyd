@@ -9,9 +9,11 @@ import os
 import errno
 import shutil
 import re
+import stat
 import sys
 import fcntl
 import signal
+import threading
 from fnmatch import fnmatch
 
 # Good enough for now :/.
@@ -26,6 +28,7 @@ from fnmatch import fnmatch
 CONFIG_PATH = os.getenv('HOME')+'/.config/keyd/app.conf'
 LOCKFILE = os.getenv('HOME')+'/.config/keyd/app.lock'
 LOGFILE = os.getenv('HOME')+'/.config/keyd/app.log'
+FIFO_PATH = '/tmp/rlocal/keyd-application-mapper/fifo'
 
 KEYD_BIN = os.environ.get('KEYD_BIN', 'keyd')
 
@@ -606,32 +609,131 @@ def normalize_class(s):
 def normalize_title(s):
     return re.sub(r'[\W_]+', '-', s).strip('-').lower()
 
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def init_fifo():
+    os.makedirs(os.path.dirname(FIFO_PATH), exist_ok=True)
+
+    if os.path.exists(FIFO_PATH) and not stat.S_ISFIFO(os.stat(FIFO_PATH).st_mode):
+        os.unlink(FIFO_PATH)
+
+    if not os.path.exists(FIFO_PATH):
+        os.mkfifo(FIFO_PATH, 0o600)
+
+
+def paused():
+    """Whether any live client is currently holding bindings down.
+
+    A client that dies without sending resume would otherwise pin bindings
+    forever, so liveness is rechecked here rather than trusted from the fifo.
+    Holding this as a set also refcounts nesting, e.g. a rofi menu whose action
+    opens a second rofi.
+    """
+    for pid in list(pausers):
+        if not pid_alive(pid):
+            pausers.discard(pid)
+
+    return bool(pausers)
+
+
+def handle_command(line):
+    """Serve one `<pause|resume> <pid>` line from the fifo.
+
+    Clients like rofi grab the keyboard without ever taking input focus, so no
+    monitor reports them and the window underneath keeps its app.conf bindings
+    applied over the grab. Such a client announces itself here instead.
+    """
+    fields = line.split()
+    if len(fields) != 2 or not fields[1].isdigit():
+        print(f'{FIFO_PATH}: malformed command: {line!r}')
+        return
+
+    cmd, pid = fields[0], int(fields[1])
+
+    if cmd == 'pause':
+        pausers.add(pid)
+    elif cmd == 'resume':
+        pausers.discard(pid)
+    else:
+        print(f'{FIFO_PATH}: unknown command: {cmd!r}')
+        return
+
+    apply_bindings()
+
+
+def fifo_loop():
+    # Opening read-write keeps a writer on the fifo, so a client disconnecting
+    # never reads as EOF and the loop never has to reopen.
+    fd = os.open(FIFO_PATH, os.O_RDWR)
+    buf = b''
+
+    while True:
+        buf += os.read(fd, 4096)
+
+        while b'\n' in buf:
+            line, buf = buf.split(b'\n', 1)
+            handle_command(line.decode('utf8', 'replace').strip())
+
+
 last_mtime = os.path.getmtime(CONFIG_PATH)
-def on_window_change(cls, title):
+last_window = ('', '')
+applied = None
+pausers = set()
+apply_lock = threading.Lock()
+
+def apply_bindings():
     global last_mtime
     global config
+    global applied
 
-    cls = normalize_class(cls)
-    title = normalize_title(title)
+    with apply_lock:
+        cls, title = ('', '') if paused() else last_window
 
-    mtime = os.path.getmtime(CONFIG_PATH)
+        cls = normalize_class(cls)
+        title = normalize_title(title)
 
-    if mtime != last_mtime:
-        print(CONFIG_PATH + ': Updated, reloading config...')
-        config = parse_config(CONFIG_PATH)
-        last_mtime = mtime
+        mtime = os.path.getmtime(CONFIG_PATH)
 
-    if args.verbose:
-        print(f'Active window: {cls}|{title}')
+        if mtime != last_mtime:
+            print(CONFIG_PATH + ': Updated, reloading config...')
+            config = parse_config(CONFIG_PATH)
+            last_mtime = mtime
 
-    bindings = lookup_bindings(cls, title)
-    subprocess.run([KEYD_BIN, 'bind', 'reset', *bindings], stdout=subprocess.DEVNULL)
+        if args.verbose:
+            print(f'Active window: {cls}|{title}' + (' (paused)' if pausers else ''))
+
+        bindings = lookup_bindings(cls, title)
+
+        # Pausing a window that had no app bindings resolves to the same reset
+        # that is already live, so skip the redundant call to keyd.
+        if bindings == applied:
+            return
+
+        applied = bindings
+        subprocess.run([KEYD_BIN, 'bind', 'reset', *bindings], stdout=subprocess.DEVNULL)
+
+
+def on_window_change(cls, title):
+    global last_window
+
+    last_window = (cls, title)
+    apply_bindings()
 
 
 mon = get_monitor(on_window_change)
 mon.init()
+init_fifo()
 
 if args.daemonize:
     daemonize()
+
+# Past the fork: a thread started before it would not survive into the child.
+threading.Thread(target=fifo_loop, daemon=True).start()
 
 mon.run()
